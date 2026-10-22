@@ -402,6 +402,9 @@ impl LoginService {
         };
         let info = resolve_edition(Some(DEFAULT_EDITION));
         let handle = self.new_handle_for_provider(info, kind_id(kind));
+        if kind == ProviderKind::Codex {
+            handle.update(|task| task.edition = "global".to_string());
+        }
         handle.update(|task| {
             task.state = Some(state.clone());
             task.auth_url = Some(auth_url);
@@ -893,6 +896,56 @@ impl LoginService {
                         "[Login]",
                         &format!("❌ Antigravity 网页登录换取凭证失败: {}", error.message),
                     );
+                    Err(error)
+                }
+            };
+        }
+        // Codex OAuth 使用标准 `code` / `state` + PKCE，浏览器回调落到网关
+        // `/auth/callback`。网页登录窗口和系统浏览器都走同一个任务收尾入口。
+        if kind == ProviderKind::Codex {
+            let parsed = url::Url::parse(callback_url)
+                .map_err(|_| GatewayError::with_status(400, "Codex 登录回调地址无效"))?;
+            if parsed.path() != crate::server::core::providers::codex::endpoints::CALLBACK_PATH {
+                return Err(GatewayError::with_status(400, "Codex 登录回调地址无效"));
+            }
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                let message = format!("授权被拒绝（{error}）");
+                finish_task_error(&handle, &message);
+                return Err(GatewayError::with_status(400, message));
+            }
+            let callback_state = params.get("state").map(String::as_str).unwrap_or("");
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            if callback_state.trim() != state {
+                return Err(GatewayError::with_status(400, "回调地址与当前 Codex 登录任务不匹配"));
+            }
+            if code.trim().is_empty() {
+                return Err(GatewayError::with_status(400, "Codex 回调缺少授权码，请重新发起网页登录"));
+            }
+            return match adapter_for(kind)
+                .exchange_login_code(&self.store, code, state)
+                .await
+            {
+                Ok(account_id) => {
+                    let session = json!({
+                        "accountUid": account_id,
+                        "nickname": Value::Null,
+                        "edition": task.edition,
+                        "provider": task.provider,
+                    });
+                    handle.update(|task| {
+                        task.done = true;
+                        task.session = Some(session);
+                        task.finished_at = Some(logging::now_ms());
+                    });
+                    Ok(LoginCallbackSubmission::Completed(account_id))
+                }
+                Err(error) => {
+                    finish_task_error(&handle, &error.message);
+                    logging::log("[Login]", &format!("❌ Codex 网页登录换取凭证失败: {}", error.message));
                     Err(error)
                 }
             };

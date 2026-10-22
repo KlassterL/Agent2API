@@ -670,7 +670,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // WorkBuddy 的白名单 → 控制台白屏，日志上什么也看不出）。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "orcaterm" => None,
+        | "kuku" | "antigravity" | "officeace" | "orcaterm" | "codex" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -808,7 +808,7 @@ fn navigate_login_window(app: &AppHandle, label: &str, target: &str) {
     }
 }
 
-/// 归一化前端传来的 provider id（缺省 workbuddy，只认这五家）。
+/// 校验前端传来的网页登录 provider id；缺省 workbuddy 以兼容旧版界面。
 ///
 /// ── 为什么 Cline 只列「网页登录」这一条路 ─────────────────────
 /// 它的设备授权登录走的就是这条 IPC（壳侧把授权页开出来、后端轮询换令牌），
@@ -823,6 +823,7 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 少了它前端会收到「未知的 provider」而登录按钮直接失败。
         "workbuddy-intl" => Ok("workbuddy-intl"),
         "raccoon" => Ok("raccoon"),
+        "codex" => Ok("codex"),
         // Qoder 两个地区（2026-10 拆家后是独立 provider）：设备授权两站同构，
         // 壳侧只透传 provider id，地区由后端按 id 反查（与 ZCode 同款）。
         "qoder" => Ok("qoder"),
@@ -1115,6 +1116,7 @@ pub async fn start(
         // 归属已经在 provider id 里 —— 与 ZCode 同款，不再读 edition 形参。
         "qoder" => "cn",
         "qoder-intl" => "intl",
+        "codex" => "global",
         // ZCode 的两个地区由 **provider 本身**决定（界面上是两张卡片，
         // 没有地区下拉，因此面板不会传 `edition`）。不看 `edition` 形参的
         // 后果只是标题里的「国内版/国际版」四个字，但既然信息已经在
@@ -1130,7 +1132,11 @@ pub async fn start(
             if edition == "intl" { "intl" } else { "cn" }
         }
     };
-    let edition_label = if edition_id == "intl" { "国际版" } else { "国内版" };
+    let edition_label = match edition_id {
+        "intl" => "国际版",
+        "global" => "",
+        _ => "国内版",
+    };
     // 系统浏览器模式对 workbuddy / qoder / cline 都开放：三家的判定都在后端
     // （轮询上游 auth/token、轮询设备令牌、轮询设备授权），浏览器在哪登录都行。
     // 小浣熊**只有内嵌窗口**能收回调（自定义协议深链要靠系统注册，见模块头），
@@ -1181,6 +1187,7 @@ pub async fn start(
         // Qoder 两家品牌名自带地区（两张卡片、无地区下拉），标题不拼后缀
         "qoder" => "Qoder 中国版",
         "qoder-intl" => "Qoder 国际版",
+        "codex" => "Codex",
         "cline-free" => "Cline Free",
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
@@ -1210,7 +1217,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity" | "officeace"
+        | "qoder-intl" | "codex" | "antigravity" | "officeace"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

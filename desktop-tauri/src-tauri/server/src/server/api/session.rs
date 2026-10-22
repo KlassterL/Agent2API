@@ -212,6 +212,17 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             None => return management_error(400, format!("未知的提供商：{other}")),
         },
     };
+    // Codex 使用官方 CLI 登记的固定 localhost:1455 回调 URI。桌面本地面板
+    // 必须先启动转发器，再生成授权 URL；否则浏览器无法完成 OAuth 回调。
+    if kind == crate::server::core::providers::ProviderKind::Codex && state.local_panel {
+        if let Err(error) = crate::server::core::providers::codex::callback_server::ensure_running(
+            state.port,
+        )
+        .await
+        {
+            return management_error(503, error);
+        }
+    }
     // Qoder：设备授权，两站同构。拆家后界面上是两张卡片（`qoder` /
     // `qoder-intl`），点哪张就发哪个 provider id —— 地区由 **provider id**
     // 反查（与下面 ZCode 同一条理由：`edition` 是前端回显字段，拿它定地区
@@ -1367,6 +1378,40 @@ fn antigravity_callback_url(code: &str, state: &str) -> String {
     query.append_pair("code", code);
     query.append_pair("state", state);
     format!("http://localhost/oauth-callback?{}", query.finish())
+}
+
+/// Codex OAuth loopback callback. OAuth state is also the login task id, so this
+/// public browser endpoint needs no API key and delegates all validation to the
+/// shared login task handler.
+pub async fn login_codex_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(400, "登录失败：回调缺少 state 或授权码，请重新发起网页登录。");
+    }
+    let callback_url = codex_callback_url(&code, &task_state);
+    match state.login().submit_login_callback(&task_state, &callback_url).await {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
+fn codex_callback_url(code: &str, state: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("code", code);
+    query.append_pair("state", state);
+    format!("http://localhost{}?{}", crate::server::core::providers::codex::endpoints::CALLBACK_PATH, query.finish())
 }
 
 // ─── POST /api/session/refresh ──────────────────────────────

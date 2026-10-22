@@ -439,10 +439,9 @@ function WebLoginSection({
         const active = modes?.find(item => item.value === modeRef.current)
         return { button: web.button, hint: active?.hint || web.hint || '' }
       },
-      // 传哪个 edition 给壳侧：写死的 edition → 地区分段当前值（Qoder 两站都要登录）
-      // → 'cn'（其余家既没有地区级，后端那条链也不读这个字段）
+      // 传哪个 edition 给壳侧：Codex 用 global；其余按写死地区 / 当前地区 / cn 兜底。
       start: () => shared().workbuddyDesktop?.startLogin(
-        web.edition || regionRef.current || 'cn',
+        prefix === 'codex' ? 'global' : (web.edition || regionRef.current || 'cn'),
         modeRef.current || 'embedded',
         prefix,
       ),

@@ -177,11 +177,7 @@ impl ChatRequestPlan {
     ///
     /// 与 [`Self::chat`] 同一动机：调用点只回答「响应是哪套协议」，
     /// 不自己拼 `ChatRequestPlan` 的字段。
-    pub fn commandcode_ndjson(
-        url: String,
-        headers: Vec<(String, String)>,
-        body: Value,
-    ) -> Self {
+    pub fn commandcode_ndjson(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
         Self {
             url,
             headers,
@@ -198,7 +194,28 @@ impl ChatRequestPlan {
     /// 与另外两个构造器同一动机（调用点只回答「响应是哪套协议」），
     /// 单独一个名字是因为它要连**请求信封**一起表达 —— 那种信封只有
     /// `antigravity_outbound` 会造。
-    pub fn antigravity_gemini(
+    pub fn antigravity_gemini(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::AntigravityGemini,
+        }
+    }
+
+    /// Codex Responses API：chat 形态由 provider 转成 Responses body，响应流
+    /// 再由 `UpstreamResponse::CodexResponses` 翻译回统一 Chat SSE。
+    pub fn codex_responses(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::CodexResponses,
+        }
+    }
+
+    /// Codex Images：保留 Responses SSE 事件供图片接口收集 image_generation_call 结果。
+    pub fn codex_images_responses(
         url: String,
         headers: Vec<(String, String)>,
         body: Value,
@@ -207,7 +224,7 @@ impl ChatRequestPlan {
             url,
             headers,
             body,
-            response: UpstreamResponse::AntigravityGemini,
+            response: UpstreamResponse::CodexImageResponses,
         }
     }
 }
@@ -247,6 +264,10 @@ pub enum UpstreamResponse {
     /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
     /// 全部留在编排层，只有字节形态在翻译器里变。
     AntigravityGemini,
+    /// OpenAI Codex Responses SSE（翻译器复用 Responses 协议状态机）。
+    CodexResponses,
+    /// Codex 图片生成 Responses SSE（保留原始事件与 base64 图片结果）。
+    CodexImageResponses,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -629,9 +650,7 @@ pub trait ProviderAdapter: Send + Sync {
         store: &'a AccountStore,
         account_id: &'a str,
         force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>>;
 
     /// 模型目录刷新是否走「账号」这一维（默认 true；Cline 覆写为 false）。
     ///
@@ -717,7 +736,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// 「同一账号重试」那一档给出（见 `config::RetrySettings`）。
     /// 适配器据此判断该不该再退避 —— 而不是自己去读全局设置：那样写的话
     /// 「哪一档管什么」这条规则就会漏进每个适配器里各实现一遍。
-    fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
+    fn retry_advice(
+        &self,
+        _error_body: &Value,
+        _attempt: usize,
+        _budget: usize,
+    ) -> Option<RetryAdvice> {
         None
     }
 
@@ -1035,9 +1059,8 @@ pub trait ProviderAdapter: Send + Sync {
         &'a self,
         _store: &'a AccountStore,
         _account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         let kind = self.kind();
         Box::pin(async move {
             Err(GatewayError::with_status(
@@ -1152,6 +1175,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 余额全部已接通（建会话 → assistant SSE，`is_stateful` 为 true，
         // 见 `orcaterm/mod.rs` 与 `orcaterm/adapter.rs` 的模块头）
         ProviderKind::OrcaTerm => &super::orcaterm::ORCATERM_ADAPTER,
+        ProviderKind::Codex => &super::codex::CODEX_ADAPTER,
     }
 }
 
@@ -1251,6 +1275,8 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 远程模型目录（静态清单，`supports_model_refresh()` 为 false）——
         // 进本列表只代表「已实现」（与 Zcode 同一口径：刷新循环对它是空操作）。
         ProviderKind::OrcaTerm,
+        // Codex 使用静态模型清单，没有远程目录刷新接口。
+        ProviderKind::Codex,
     ]
 }
 
@@ -1284,7 +1310,11 @@ pub struct ModelRefreshOutcome {
 impl ModelRefreshOutcome {
     /// 真刷新成功（`count` 是落地后的条目数）
     pub fn refreshed(count: usize) -> Self {
-        Self { refreshed: true, count, message: None }
+        Self {
+            refreshed: true,
+            count,
+            message: None,
+        }
     }
 
     /// 没有刷（按缓存/TTL 跳过、上游没给可用清单、没有可用的家等）——
@@ -1295,7 +1325,11 @@ impl ModelRefreshOutcome {
 
     /// 尝试刷新但失败（`reason` 是会显示给用户的原因）
     pub fn failed(reason: impl Into<String>) -> Self {
-        Self { refreshed: false, count: 0, message: Some(reason.into()) }
+        Self {
+            refreshed: false,
+            count: 0,
+            message: Some(reason.into()),
+        }
     }
 }
 
@@ -1334,10 +1368,9 @@ fn seed_current_workbuddy_defaults() {
             .iter()
             .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
             .collect();
-        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(
-            region.provider_id(),
-            &ids,
-        ) {
+        if let Some(summary) =
+            crate::server::core::model_rules::seed_workbuddy_defaults(region.provider_id(), &ids)
+        {
             crate::server::logging::log("[Models]", &summary);
         }
     }
@@ -1399,7 +1432,8 @@ pub async fn refresh_implemented(store: &AccountStore) -> Vec<Value> {
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    let results = super::catalog_refresh::refresh(store, &serde_json::Map::new(), None, false).await;
+    let results =
+        super::catalog_refresh::refresh(store, &serde_json::Map::new(), None, false).await;
     // 刷新落地后补种一次：新增的带前缀 / 别名模型在这一刻才出现在清单里
     // （与开头那次同一件事 —— 那时种的是缓存恢复的清单）
     seed_current_cline_defaults();

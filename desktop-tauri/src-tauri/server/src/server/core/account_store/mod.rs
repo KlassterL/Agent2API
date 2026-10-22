@@ -106,6 +106,7 @@ pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
 pub mod commandcode_accounts;
+pub mod codex_accounts;
 pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
@@ -221,6 +222,11 @@ pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers:
 /// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
 pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Antigravity,
+);
+
+/// Codex provider id（从提供商注册表推导）。
+pub(crate) const CODEX_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Codex,
 );
 
 /// OfficeAce（华为云果办 / OfficeClaw）provider id（**从注册表推导**，同

@@ -50,7 +50,7 @@ export function typeValueOf(value: string): AccountType {
 }
 
 /**
- * 内置家的真实图标：`id → assets/providers/<file>.png`，图取自各客户端安装目录
+ * 内置家的真实图标：`id → assets/providers/<file>`，图取自各客户端安装目录或官方品牌资产
  * 内嵌的图标（与系统里显示的为同一张；AutoClaw / WorkBuddy 各自两地、Cline 两种
  * 账号、Accio / ZCode 两地共用一张 —— 它们本来就是同一个客户端）。
  * 自定义家与没收录图标的家回落到首字母徽章。
@@ -58,6 +58,8 @@ export function typeValueOf(value: string): AccountType {
  * （models-page）与签到中心的提供商行（checkin-page）用同一份映射，别处不要照抄。
  */
 export const PROVIDER_ICONS: Record<string, string> = {
+  // Codex 与 OpenAI 预置 API 共用 OpenAI 官方品牌资源中的 Blossom 矢量图。
+  codex: 'assets/providers/openai.svg',
   workbuddy: 'assets/providers/workbuddy.png',
   'workbuddy-intl': 'assets/providers/workbuddy.png',
   raccoon: 'assets/providers/raccoon.png',

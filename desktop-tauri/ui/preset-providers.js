@@ -87,7 +87,7 @@
 
   const PRESET_PROVIDERS = [
     {
-      key: 'openai', name: 'OpenAI', icon: 'openai.png',
+      key: 'openai', name: 'OpenAI', icon: 'openai.svg',
       protocol: P.openai, baseUrl: 'https://api.openai.com/v1',
     },
     {

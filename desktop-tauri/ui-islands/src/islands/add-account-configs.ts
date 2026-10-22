@@ -731,6 +731,23 @@ const ANTIGRAVITY: ProviderConfig = {
   ],
 }
 
+/** Codex 通过 OpenAI OAuth + PKCE 登录，凭证由网关在回调后保存并自动续期。 */
+const CODEX: ProviderConfig = {
+  provider: 'codex',
+  label: 'Codex',
+  desktop: false,
+  webLogin: {
+    noteHtml: t('使用 OpenAI 账号登录 Codex，授权完成后自动加入账号列表。'),
+    button: t('打开 Codex 网页登录'),
+    busyText: t('等待 Codex 授权完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口登录；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开并复用已登录的 OpenAI 账号；授权后自动加入列表') },
+    ],
+  },
+  fields: [],
+}
+
 /**
  * OfficeAce（华为云果办 / OfficeClaw）：一家一个 provider，没有地区之分。
  *
@@ -872,6 +889,8 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // OrcaTerm（腾讯云遨驰终端桌面客户端）：粘贴 accessToken / 导入桌面端登录态，
   // 排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   ORCATERM,
+  // Codex：网页登录 OAuth，按后端提供商注册表顺序排在末尾。
+  CODEX,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */
@@ -959,6 +978,7 @@ export function methodsOf(config: ProviderConfig, region: string): MethodId[] {
     if (method.id === 'oauth') return Boolean(config.oauthLogin)
     if (method.id === 'sms') return Boolean(config.smsLogin)
     if (method.id === 'web') return Boolean(config.webLogin) && (!config.webLogin?.region || region === config.webLogin.region)
+    if (method.id === 'manual') return config.fields.length > 0
     if (method.id === 'file') return Boolean(config.fileImport)
     if (method.id === 'desktop') return desktopImportAvailable(config)
     return true

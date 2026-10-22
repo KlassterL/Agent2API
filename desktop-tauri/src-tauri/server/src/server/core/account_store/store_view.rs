@@ -361,6 +361,8 @@ impl AccountStore {
             // tokenTail / tokenExpireAt（续期是否在工作可被肉眼校验，见
             // `orcaterm_accounts.rs`）
             self.to_orcaterm_public_account(record)
+        } else if record.provider() == super::CODEX_PROVIDER_ID {
+            self.to_codex_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

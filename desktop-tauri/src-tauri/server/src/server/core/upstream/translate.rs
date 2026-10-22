@@ -52,6 +52,52 @@ use futures::Stream;
 use crate::server::core::protocol::anthropic_outbound::ChatFromAnthropicStream;
 use crate::server::core::protocol::antigravity_stream::ChatFromAntigravityStream;
 use crate::server::core::protocol::commandcode_outbound::ChatFromCommandCodeStream;
+use crate::server::core::protocol::responses_outbound::ChatFromResponsesStream;
+
+/// Codex 图片 Responses SSE：原样保留 `image_generation_call` 与分片图片事件。
+pub struct CodexImageResponsesStream {
+    inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+}
+
+impl CodexImageResponsesStream {
+    pub fn new(
+        response: reqwest::Response,
+        telemetry: &Arc<super::usage::RequestTelemetry>,
+    ) -> Self {
+        use futures::StreamExt;
+        let described = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        let inner = super::stall::idle_guard(
+            Box::pin(described),
+            Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
+        );
+        Self {
+            inner,
+            capture: telemetry.capture(),
+        }
+    }
+}
+
+impl Stream for CodexImageResponsesStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(capture) = &this.capture {
+                    capture.push(&bytes);
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            other => other,
+        }
+    }
+}
 
 /// 上游 Anthropic SSE → 标准 chat SSE 的字节流（`reqwest::Response` 直接进来）。
 ///
@@ -343,6 +389,79 @@ impl Stream for AntigravityToChatStream {
                     self.upstream_done = true;
                     // 文案已在构造时描述好（见 inner 字段说明）：原样上抛，
                     // 由下游的流 / 聚合器转成错误帧或 502
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        }
+    }
+}
+
+/// Codex Responses SSE → 标准 Chat SSE。请求与协议状态机均复用现有 Responses
+/// 转换实现，保持账号轮换、限额处理、usage 记账和取消逻辑在统一编排层。
+pub struct ResponsesToChatStream {
+    inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+    machine: ChatFromResponsesStream,
+    pending: VecDeque<Bytes>,
+    upstream_done: bool,
+    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+}
+
+impl ResponsesToChatStream {
+    pub fn new(
+        response: reqwest::Response,
+        model: &str,
+        telemetry: &Arc<super::usage::RequestTelemetry>,
+    ) -> Self {
+        use futures::StreamExt;
+        let described = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        let guarded = super::stall::idle_guard(
+            Box::pin(described),
+            Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
+        );
+        Self {
+            inner: guarded,
+            machine: ChatFromResponsesStream::new(model),
+            pending: VecDeque::new(),
+            upstream_done: false,
+            capture: telemetry.capture(),
+        }
+    }
+}
+
+impl Stream for ResponsesToChatStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use futures::StreamExt;
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if self.upstream_done {
+                return Poll::Ready(None);
+            }
+            match self.inner.poll_next_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.upstream_done = true;
+                    for frame in self.machine.finish() {
+                        self.pending.push_back(frame);
+                    }
+                }
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if let Some(capture) = &self.capture {
+                        capture.push(&bytes);
+                    }
+                    for frame in self.machine.push(&bytes[..]) {
+                        self.pending.push_back(frame);
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.upstream_done = true;
                     return Poll::Ready(Some(Err(error)));
                 }
             }

@@ -190,6 +190,8 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         // `orcaterm::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
         // 与 ZCode 同一口径：如实回 `(false, 0)`，界面的「来源」列显示成内置清单。
         ProviderKind::OrcaTerm => (false, 0),
+        // Codex 使用内置模型清单，没有可供网关拉取的目录接口。
+        ProviderKind::Codex => (false, 0),
     }
 }
 

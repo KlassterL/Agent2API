@@ -121,6 +121,9 @@ pub mod codearts;
 /// **HTTP 恒 200**（错误在流内），因此走
 /// `UpstreamResponse::CommandCodeNdjson` 那条翻译层，见 `commandcode/mod.rs`。
 pub mod commandcode;
+/// Codex（OpenAI Codex CLI）：网页登录 OAuth + refresh token 续期 +
+/// 静态模型目录 + Responses 上游转发（翻译回统一 Chat SSE）。
+pub mod codex;
 pub mod content_block;
 /// 自定义提供商的**运行期接线**（目录聚合的追加段 + Chat Completions 协议
 /// 转发）。它不进本文件的身份体系（`ProviderKind` / `PROVIDERS`，见
@@ -469,6 +472,8 @@ pub enum ProviderKind {
     /// 会话转发（建会话 → assistant SSE）+ 余额（月度 AI 配额）；
     /// `is_stateful` 为 true（请求内会话），见 `orcaterm/mod.rs` 的模块头。
     OrcaTerm,
+    /// Codex（OpenAI Codex CLI）：网页登录 OAuth + Responses 上游转发。
+    Codex,
 }
 
 /// 一个提供商的静态元数据。
@@ -565,6 +570,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 它的模型名（glm-5.3 / kimi-k3 / deepseek-v4-* 等）与 codearts / catpaw /
     // zcode 大面积同名，同样靠末位让同名模型优先归已有各家。
     ProviderMeta { id: "orcaterm", label: "OrcaTerm" },
+    ProviderMeta { id: "codex", label: "Codex" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -649,6 +655,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
+        "codex" => Some(ProviderKind::Codex),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -691,6 +698,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
         ProviderKind::OrcaTerm => "orcaterm",
+        ProviderKind::Codex => "codex",
     }
 }
 

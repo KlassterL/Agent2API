@@ -1157,6 +1157,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 if import_desktop { "desktop" } else { "manual" },
             )
         }
+        Some(crate::server::core::providers::ProviderKind::Codex) => {
+            return management_error(400, "Codex 账号请使用网页登录添加");
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
