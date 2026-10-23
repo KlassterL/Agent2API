@@ -214,8 +214,8 @@ impl ChatRequestPlan {
         }
     }
 
-    /// Codex Images：保留 Responses SSE 事件供图片接口收集 image_generation_call 结果。
-    pub fn codex_images_responses(
+    /// Codex Images API：上游 JSON 或 SSE 已是公开图片协议，按原字节透传。
+    pub fn codex_images(
         url: String,
         headers: Vec<(String, String)>,
         body: Value,
@@ -224,13 +224,13 @@ impl ChatRequestPlan {
             url,
             headers,
             body,
-            response: UpstreamResponse::CodexImageResponses,
+            response: UpstreamResponse::CodexImages,
         }
     }
 }
 
 /// 上游响应的协议（**请求体与响应必须同源**：这套标记由适配器在构造请求时
-/// 一并给出，编排层只按它选翻译层，不做二次推断）。
+/// 一并给出，编排层只按它选翻译或透传方式，不做二次推断）。
 ///
 /// ── 为什么需要它 ────────────────────────────────────────────
 /// 本项目的历史前提是「所有上游都说 Chat」（见 `protocol` 的模块头），于是
@@ -266,8 +266,8 @@ pub enum UpstreamResponse {
     AntigravityGemini,
     /// OpenAI Codex Responses SSE（翻译器复用 Responses 协议状态机）。
     CodexResponses,
-    /// Codex 图片生成 Responses SSE（保留原始事件与 base64 图片结果）。
-    CodexImageResponses,
+    /// Codex Images API 的 JSON/SSE 响应（原样透传，不进入 Chat/Responses 翻译器）。
+    CodexImages,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。

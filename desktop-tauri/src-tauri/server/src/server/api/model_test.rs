@@ -40,6 +40,7 @@
 //!      `anthropic`）。按所选协议组装下游请求、经过 `core::protocol` 转换成内部
 //!      Chat 形态送入转发层，收到上游回复后再按所选协议做回程转换与字段提取，
 //!      一并验证协议转换链路是否畅通。
+//!      Codex GPT Image 测试使用与 `/v1/images/generations` 相同的直接 Images API 适配。
 //!
 //! 除这几处外，其它一切都与真实请求一致 —— 包括**会消耗额度**。
 //!
@@ -72,8 +73,8 @@ use serde_json::{json, Value};
 
 use crate::server::core::key_scope::KeyScope;
 use crate::server::core::protocol::{anthropic, responses};
+use crate::server::core::providers::{catalog, codex::models as codex_models};
 use crate::server::core::proxies::ResolvedProxy;
-use crate::server::core::providers::catalog;
 use crate::server::core::upstream::aggregate::aggregate_frame_stream;
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::sse::FramePolicy;
@@ -97,19 +98,19 @@ pub const DEFAULT_TEST_PROMPT: &str = "你好";
 /// 与 OmniProxy 的 `MAX_TEST_PROMPT_LENGTH` 同值：测试不是聊天，一段超长提示词
 /// 既没有意义（结论还是「通不通」），又可能把上游的限额 / 风控额度一次烧掉。
 const MAX_PROMPT_CHARS: usize = 4000;
-/// 单次测试的**总预算**（含等上游首帧与聚合完整段回答）。
+/// 普通模型测试的总预算（含等上游首帧与收完回答）。
 ///
 /// 为什么测试要有自己的上界（而生产请求没有）：生产请求的等待由客户端自己决定
 /// （它随时能断开），而测试是**弹窗里的一次等待** —— 没有上界时，一个上游卡住
 /// 的账号会让弹窗一直转圈，用户既不知道该等多久、也不知道能不能关。
 ///
-/// ── 为什么是 50 秒（这个数字被桌面壳的请求超时卡住）────────────
+/// ── 为什么普通测试是 50 秒 ───────────────────────────────────
 /// 桌面端的管理 API 调用经 `workbuddyDesktop` 桥走本机 HTTP，而那条通道有
-/// **60 秒**总超时（`src/gateway.rs` 的 `REQUEST_TIMEOUT_MS`）。测试若跑得比它久，
-/// 界面看到的是「连接本地代理超时」—— 一个与真实原因无关的错。
-/// 所以这里的上界必须留在它之内：50 秒 ≤ 60 秒，客户端先拿到一个说明白的
-/// 「测试超时」，而不是一个误导性的传输层错误。
+/// **60 秒**普通请求超时（`src/gateway.rs` 的 `REQUEST_TIMEOUT_MS`）。
 const TEST_TIMEOUT: Duration = Duration::from_secs(50);
+/// Codex 图片生成可能需要更久；桌面桥对 `/api/models/test` 单独放宽到 150 秒，
+/// 所以这里用一个统一的 120 秒预算，覆盖建流、生成图片与读完上游事件流。
+const CODEX_IMAGE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 网关对话协议（三选一，与 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 一一对应）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +213,43 @@ fn build_responses_body(
         }
     }
     body
+}
+
+/// 组装与 `/v1/images/generations` 等价的 Codex 图片测试请求。
+fn build_codex_image_test_request(
+    image_model: &str,
+    prompt: &str,
+    system_prompt: &str,
+) -> Result<(Value, Value), String> {
+    let image_prompt = if system_prompt.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{system_prompt}\n\n{prompt}")
+    };
+    let protocol_request = json!({
+        "model": image_model,
+        "prompt": image_prompt.clone(),
+        "response_format": "b64_json",
+    });
+    let image_request = super::images::image_request_from_json(
+        &protocol_request,
+        "generate",
+        &[],
+        None,
+    )
+    .map_err(|error| error.message)?;
+    let mut request_body = json!({
+        "model": image_model,
+        "messages": [{ "role": "user", "content": image_prompt }],
+        "stream": true,
+    });
+    let mut image_request = image_request;
+    image_request["stream"] = Value::Bool(true);
+    image_request["partial_images"] = Value::from(0);
+    if let Some(object) = request_body.as_object_mut() {
+        object.insert(super::images::IMAGE_REQUEST_FIELD.to_string(), image_request);
+    }
+    Ok((protocol_request, request_body))
 }
 
 /// 组装 Anthropic Messages 下游请求体（对应 `POST /v1/messages`）。
@@ -381,6 +419,7 @@ fn translate_completion(
             error: None,
             reply: message_field(&chat_completion, "content"),
             reasoning_text: message_field(&chat_completion, "reasoning_content"),
+            image_data_urls: Vec::new(),
             raw_response: pipeline::capture_raw_json(&chat_completion),
         },
         TestProtocol::Responses => {
@@ -399,6 +438,7 @@ fn translate_completion(
                     error: Some(message),
                     reply: String::new(),
                     reasoning_text: String::new(),
+                    image_data_urls: Vec::new(),
                     raw_response,
                 };
             }
@@ -408,6 +448,7 @@ fn translate_completion(
                 error: None,
                 reply,
                 reasoning_text,
+                image_data_urls: Vec::new(),
                 raw_response,
             }
         }
@@ -420,9 +461,159 @@ fn translate_completion(
                 error: None,
                 reply,
                 reasoning_text,
+                image_data_urls: Vec::new(),
                 raw_response,
             }
         }
+    }
+}
+
+/// 从 Codex 图片结果里提取模型测试结论。
+fn translate_codex_image_response(response: Value, status: i64) -> TestOutcome {
+    let raw_response = pipeline::capture_raw_json(&response);
+    if let Some(data) = response.get("data").and_then(Value::as_array) {
+        let output_format = response
+            .get("output_format")
+            .and_then(Value::as_str)
+            .unwrap_or("png");
+        let image_data_urls = data
+            .iter()
+            .filter_map(|item| {
+                if let Some(result) = item.get("b64_json").and_then(Value::as_str) {
+                    if result.is_empty() {
+                        return None;
+                    }
+                    if result.starts_with("data:image/") {
+                        return Some(result.to_string());
+                    }
+                    let format = item
+                        .get("output_format")
+                        .and_then(Value::as_str)
+                        .unwrap_or(output_format);
+                    let mime = match format {
+                        "jpeg" | "jpg" => "image/jpeg",
+                        "webp" => "image/webp",
+                        _ => "image/png",
+                    };
+                    return Some(format!("data:{mime};base64,{result}"));
+                }
+                item.get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| !url.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        if !image_data_urls.is_empty() {
+            let image_count = image_data_urls.len();
+            return TestOutcome {
+                status,
+                error: None,
+                reply: format!("图片生成成功（{image_count} 张）"),
+                reasoning_text: String::new(),
+                image_data_urls,
+                raw_response,
+            };
+        }
+    }
+    if let Some(message) = response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        return TestOutcome {
+            status: if status >= 400 { status } else { 502 },
+            error: Some(message.to_string()),
+            reply: String::new(),
+            reasoning_text: String::new(),
+            image_data_urls: Vec::new(),
+            raw_response,
+        };
+    }
+    let response_status = response.get("status").and_then(Value::as_str).unwrap_or("");
+    if response_status == "failed" || response_status == "incomplete" {
+        let message = response
+            .pointer("/error/message")
+            .or_else(|| response.pointer("/incomplete_details/reason"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("Codex 图片请求未完成")
+            .to_string();
+        return TestOutcome {
+            status: if status >= 400 { status } else { 502 },
+            error: Some(message),
+            reply: String::new(),
+            reasoning_text: String::new(),
+            image_data_urls: Vec::new(),
+            raw_response,
+        };
+    }
+
+    let image_count = response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| {
+            output
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                        && item
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .is_some_and(|result| !result.is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if image_count == 0 {
+        return TestOutcome {
+            status: if status >= 400 { status } else { 502 },
+            error: Some("Codex Images 未返回已完成的 GPT Image 结果".to_string()),
+            reply: String::new(),
+            reasoning_text: String::new(),
+            image_data_urls: Vec::new(),
+            raw_response,
+        };
+    }
+
+    let reply = response
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("图片生成成功（{image_count} 张）"));
+    let image_data_urls = response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image_generation_call"))
+        .filter_map(|item| {
+            let result = item.get("result").and_then(Value::as_str)?;
+            if result.is_empty() {
+                return None;
+            }
+            if result.starts_with("data:image/") {
+                return Some(result.to_string());
+            }
+            let format = item
+                .get("output_format")
+                .and_then(Value::as_str)
+                .unwrap_or("png");
+            let mime = match format {
+                "jpeg" | "jpg" => "image/jpeg",
+                "webp" => "image/webp",
+                _ => "image/png",
+            };
+            Some(format!("data:{mime};base64,{result}"))
+        })
+        .collect::<Vec<_>>();
+    TestOutcome {
+        status,
+        error: None,
+        reply,
+        reasoning_text: String::new(),
+        image_data_urls,
+        raw_response,
     }
 }
 
@@ -464,6 +655,7 @@ struct TestOutcome {
     error: Option<String>,
     reply: String,
     reasoning_text: String,
+    image_data_urls: Vec<String>,
     raw_response: Option<String>,
 }
 
@@ -494,9 +686,17 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
         );
     }
     let protocol_raw = text_field(&payload, "protocol", 32);
-    let protocol = match TestProtocol::parse(&protocol_raw) {
+    let selected_protocol = match TestProtocol::parse(&protocol_raw) {
         Ok(protocol) => protocol,
         Err(message) => return errors::management_error(400, message),
+    };
+    let codex_image_model =
+        provider.eq_ignore_ascii_case("codex") && codex_models::is_image_model(&model);
+    let protocol = selected_protocol;
+    let protocol_label = if codex_image_model {
+        "images"
+    } else {
+        protocol.as_str()
     };
     let account_id = text_field(&payload, "account_id", 128);
     let proxy_raw = text_field(&payload, "proxy", 128);
@@ -513,7 +713,7 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
                 "reasoning": "",
                 "provider": provider,
                 "model": model,
-                "protocol": protocol.as_str(),
+                "protocol": protocol_label,
                 "proxy": Value::Null,
                 "account_id": if account_id.is_empty() { Value::Null } else { Value::String(account_id) },
                 "account_name": Value::Null,
@@ -540,16 +740,24 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     let reasoning = text_field(&payload, "reasoning", 32);
     // 缺省按流式（与前端默认一致）：流式才看得到首字延迟，而那是这个测试
     // 最有价值的一个读数
-    let stream = payload.get("stream").and_then(Value::as_bool).unwrap_or(true);
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
-    let (protocol_request, request_body) = match build_protocol_request(
-        protocol,
-        &model,
-        &prompt,
-        &system_prompt,
-        &reasoning,
-        stream,
-    ) {
+    let request = if codex_image_model {
+        build_codex_image_test_request(&model, &prompt, &system_prompt)
+    } else {
+        build_protocol_request(
+            protocol,
+            &model,
+            &prompt,
+            &system_prompt,
+            &reasoning,
+            stream,
+        )
+    };
+    let (protocol_request, request_body) = match request {
         Ok(pair) => pair,
         Err(message) => {
             return ok_json(json!({
@@ -560,7 +768,7 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
                 "reasoning": "",
                 "provider": provider,
                 "model": model,
-                "protocol": protocol.as_str(),
+                "protocol": protocol_label,
                 "proxy": proxy_label,
                 "account_id": if account_id.is_empty() { Value::Null } else { Value::String(account_id) },
                 "account_name": Value::Null,
@@ -645,7 +853,8 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
         // 客户端空串：测试没有下游 UA（与上面的 record_started 同口径）
         client: String::new(),
     };
-    pipeline::record_entry(&context, None);
+    // 测试结论（包括本地超时）也落入请求日志，避免失败行只有状态码没有原因。
+    pipeline::record_entry(&context, outcome.error.clone());
     guard.complete();
 
     ok_json(json!({
@@ -654,9 +863,10 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
         "error": outcome.error,
         "reply": outcome.reply,
         "reasoning": outcome.reasoning_text,
+        "image_data_urls": outcome.image_data_urls,
         "provider": provider,
         "model": model,
-        "protocol": protocol.as_str(),
+        "protocol": protocol_label,
         "proxy": proxy_label,
         // 实际承载的家与账号（选路结果，取自 telemetry 快照）：正常情况就是
         // 请求里点名的那两个，但「账号被删 / 被禁用」这类情况下转发层给出的
@@ -694,83 +904,145 @@ async fn run_forward(
     stream: bool,
     proxy_override: Option<Option<ResolvedProxy>>,
 ) -> TestOutcome {
-    let forward = state.upstream().forward(ForwardRequest {
-        body: request_body,
-        stream,
-        // 不去重（见模块头）：并发测多个账号时，去重会让它们互相等待
-        dedupe_key: String::new(),
-        // 空头：测试不是某个客户端发来的，转发层也不该把面板的管理头透传给
-        // 上游（适配器会读会话类头，见 `passthrough_session_headers`）
-        client_headers: Default::default(),
-        telemetry: telemetry.clone(),
-        // 钉住这一家（同一个对外名可能挂在多家上，见模块头）
-        allowed_providers: Some(KeyScope::provider_only(provider)),
-        // 钉住这一个账号，且不顺延
-        pinned_account: if account_id.is_empty() {
-            None
-        } else {
-            Some(account_id.to_string())
-        },
-        // 未启用的行也要能测 —— 「先测通、再决定要不要启用」正是这颗按钮的用法。
-        // 候选直接取上面钉住的那一家，生产的「模型已在网关中关闭」门禁不适用于
-        // 测试（取舍见 `ForwardRequest::ignore_model_gate`）。
-        ignore_model_gate: true,
-        // 本次测试临时指定的出网代理 / 直连（None = 跟随账号自身配置）
-        proxy_override,
-    });
-    // 总预算套在整段转发之外（含流式聚合）：测试是一次弹窗等待，必须有上界，
-    // 否则一个卡住的上游会让弹窗一直转圈（见 TEST_TIMEOUT）
-    match tokio::time::timeout(TEST_TIMEOUT, forward).await {
-        Err(_elapsed) => TestOutcome {
-            status: 504,
-            error: Some(format!("测试超时（{} 秒内没拿到完整回答）", TEST_TIMEOUT.as_secs())),
-            reply: String::new(),
-            reasoning_text: String::new(),
-            raw_response: None,
-        },
-        Ok(Err(error)) => TestOutcome {
-            status: i64::from(error.status_code),
-            error: Some(error.message),
-            reply: String::new(),
-            reasoning_text: String::new(),
-            raw_response: None,
-        },
-        Ok(Ok(ForwardOutcome::Completion { body })) => {
-            translate_completion(protocol, model, protocol_request, 200, body)
-        }
-        Ok(Ok(ForwardOutcome::Stream { status, stream: source })) => {
-            let status = i64::from(status);
-            // `ForwardOutcome::Stream` 给的是 `Box<dyn Stream + Unpin>`，聚合器要
-            // 的是 `BoxStream`（`Pin<Box<dyn Stream>>`）—— `boxed()` 这一步就是
-            // 把这个 Unpin 的盒子换成 `'static` 的 Pin 盒子，元素类型不变
-            use futures::StreamExt;
-            match tokio::time::timeout(
-                TEST_TIMEOUT,
-                aggregate_frame_stream(source.boxed(), telemetry.clone(), FramePolicy::default()),
-            )
+    let codex_image_payload = request_body
+        .get(super::images::IMAGE_REQUEST_FIELD)
+        .cloned();
+    let codex_image_request = codex_image_payload.is_some();
+    let timeout = if codex_image_request {
+        CODEX_IMAGE_TEST_TIMEOUT
+    } else {
+        TEST_TIMEOUT
+    };
+    // 单个计时器覆盖「等上游响应 + 收完响应流」，避免先后各等 50 秒，
+    // 也给图片生成一个比普通文本测试更长、且桌面桥能承载的预算。
+    let result = tokio::time::timeout(timeout, async {
+        match state
+            .upstream()
+            .forward(ForwardRequest {
+                body: request_body,
+                // Codex 图片上游通过 Images SSE 返回；模型测试收完事件流后读取最终图片与 usage。
+                stream: stream || codex_image_request,
+                // 不去重（见模块头）：并发测多个账号时，去重会让它们互相等待
+                dedupe_key: String::new(),
+                // 空头：测试不是某个客户端发来的，转发层也不该把面板的管理头透传给
+                // 上游（适配器会读会话类头，见 `passthrough_session_headers`）
+                client_headers: Default::default(),
+                telemetry: telemetry.clone(),
+                // 钉住这一家（同一个对外名可能挂在多家上，见模块头）
+                allowed_providers: Some(KeyScope::provider_only(provider)),
+                // 钉住这一个账号，且不顺延
+                pinned_account: if account_id.is_empty() {
+                    None
+                } else {
+                    Some(account_id.to_string())
+                },
+                // 未启用的行也要能测 —— 「先测通、再决定要不要启用」正是这颗按钮的用法。
+                // 候选直接取上面钉住的那一家，生产的「模型已在网关中关闭」门禁不适用于
+                // 测试（取舍见 `ForwardRequest::ignore_model_gate`）。
+                ignore_model_gate: true,
+                // 本次测试临时指定的出网代理 / 直连（None = 跟随账号自身配置）
+                proxy_override,
+            })
             .await
-            {
-                Err(_elapsed) => TestOutcome {
-                    status: 504,
-                    error: Some(format!(
-                        "测试超时（{} 秒内没拿到完整回答）",
-                        TEST_TIMEOUT.as_secs()
-                    )),
-                    reply: String::new(),
-                    reasoning_text: String::new(),
-                    raw_response: None,
-                },
-                Ok(Err(error)) => TestOutcome {
-                    status: i64::from(error.status_code),
-                    error: Some(error.message),
-                    reply: String::new(),
-                    reasoning_text: String::new(),
-                    raw_response: None,
-                },
-                Ok(Ok(aggregated)) => {
-                    translate_completion(protocol, model, protocol_request, status, aggregated.body)
+        {
+            Err(error) => TestOutcome {
+                status: i64::from(error.status_code),
+                error: Some(error.message),
+                reply: String::new(),
+                reasoning_text: String::new(),
+                image_data_urls: Vec::new(),
+                raw_response: None,
+            },
+            Ok(ForwardOutcome::Completion { body }) if codex_image_request => TestOutcome {
+                status: 500,
+                error: Some("Codex 图片请求没有返回图片事件流".to_string()),
+                reply: String::new(),
+                reasoning_text: String::new(),
+                image_data_urls: Vec::new(),
+                raw_response: pipeline::capture_raw_json(&body),
+            },
+            Ok(ForwardOutcome::Completion { body }) => {
+                translate_completion(protocol, model, protocol_request, 200, body)
+            }
+            Ok(ForwardOutcome::Stream {
+                status,
+                stream: source,
+            }) => {
+                let status = i64::from(status);
+                if codex_image_request {
+                    let image_request = codex_image_payload
+                        .as_ref()
+                        .expect("codex_image_request 必须对应图片请求体");
+                    return match super::images::collect_image_response(
+                        source,
+                        image_request,
+                        telemetry,
+                    )
+                    .await
+                    {
+                        Err(error) => TestOutcome {
+                            status: if status >= 400 {
+                                status
+                            } else {
+                                i64::from(error.http_status().as_u16())
+                            },
+                            error: Some(error.message),
+                            reply: String::new(),
+                            reasoning_text: String::new(),
+                            image_data_urls: Vec::new(),
+                            raw_response: None,
+                        },
+                        Ok((response, response_bytes)) => {
+                            if let Some(usage) = response.get("usage") {
+                                telemetry.report_usage(usage);
+                            }
+                            let mut outcome = translate_codex_image_response(response, status);
+                            outcome.raw_response = pipeline::capture_raw_body(&response_bytes);
+                            outcome
+                        }
+                    };
+                }
+                // `ForwardOutcome::Stream` 给的是 `Box<dyn Stream + Unpin>`，聚合器要
+                // 的是 `BoxStream`（`Pin<Box<dyn Stream>>`）—— `boxed()` 这一步就是
+                // 把这个 Unpin 的盒子换成 `'static` 的 Pin 盒子，元素类型不变
+                use futures::StreamExt;
+                match aggregate_frame_stream(
+                    source.boxed(),
+                    telemetry.clone(),
+                    FramePolicy::default(),
+                )
+                .await
+                {
+                    Err(error) => TestOutcome {
+                        status: i64::from(error.status_code),
+                        error: Some(error.message),
+                        reply: String::new(),
+                        reasoning_text: String::new(),
+                        image_data_urls: Vec::new(),
+                        raw_response: None,
+                    },
+                    Ok(aggregated) => translate_completion(
+                        protocol,
+                        model,
+                        protocol_request,
+                        status,
+                        aggregated.body,
+                    ),
                 }
             }
         }
-    }
+    })
+    .await;
+
+    result.unwrap_or_else(|_| TestOutcome {
+        status: 504,
+        error: Some(format!(
+            "测试超时（{} 秒内没拿到完整回答）",
+            timeout.as_secs()
+        )),
+        reply: String::new(),
+        reasoning_text: String::new(),
+        image_data_urls: Vec::new(),
+        raw_response: None,
+    })
 }

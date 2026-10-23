@@ -102,9 +102,18 @@ pub mod terminal {
         b"data: [DONE]\r\n",
         b"data:[DONE]\r\n",
     ];
-    /// Responses：正常收尾 `response.completed`，失败收尾 `response.failed`
-    pub const RESPONSES: super::TerminalFrames =
-        &[b"event: response.completed\n", b"event: response.failed\n"];
+    /// Responses：`completed` / `incomplete` / `failed` 以及兼容的 `done` 收尾事件。
+    /// 上游可能使用 LF 或 CRLF。
+    pub const RESPONSES: super::TerminalFrames = &[
+        b"event: response.completed\n",
+        b"event: response.incomplete\n",
+        b"event: response.failed\n",
+        b"event: response.done\n",
+        b"event: response.completed\r\n",
+        b"event: response.incomplete\r\n",
+        b"event: response.failed\r\n",
+        b"event: response.done\r\n",
+    ];
     /// Anthropic Messages：`message_stop`（成功与流内错误都以它收尾）
     pub const ANTHROPIC: super::TerminalFrames = &[b"event: message_stop\n"];
 }

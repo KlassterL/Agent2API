@@ -71,6 +71,7 @@ use crate::server::config::{
     self, RetentionPatch, RetentionSettings, KEY_DAILY_RETENTION_DAYS, KEY_LOG_RETENTION_DAYS,
     KEY_REQUEST_RETENTION_DAYS, RETENTION_MAX_DAYS, RETENTION_MIN_DAYS,
 };
+use crate::server::core::debug_traffic;
 use crate::server::errors;
 use crate::server::http::{ok_json, parse_body, parse_query_ms};
 use crate::server::logging;
@@ -360,7 +361,31 @@ pub async fn stats_request_raw(
     let Some(id) = text_of(&params, "id") else {
         return errors::management_error(400, "缺少 id 参数");
     };
-    match state.request_stats().raw_body(&id) {
+    let mut preview = state.request_stats().raw_body(&id);
+    if let Some(traffic) = debug_traffic::get(&id).filter(|entry| entry.url.contains("/images/")) {
+        let upstream_request = serde_json::to_string(&traffic.request_body).unwrap_or_default();
+        let upstream_response = traffic.response_body.unwrap_or_default();
+        let response_truncated = upstream_response.ends_with('…');
+        let body = preview.get_or_insert_with(|| json!({
+            "id": id,
+            "ts": traffic.ts,
+            "requestBody": "",
+            "responseBody": "",
+            "truncated": false,
+        }));
+        // Images API 结果通常是 128 KiB 以上的 base64；request_raw 为通用对话预览
+        // 设了 128 KiB 上限，图片结果则复用调试报文表（单条 2 MiB、总量 64 MiB）
+        // 中的完整上游 Images JSON/SSE，避免为了图片把所有请求正文的存储上限抬高。
+        body["requestBody"] = Value::String(upstream_request);
+        if !upstream_response.is_empty() {
+            body["responseBody"] = Value::String(upstream_response);
+            body["truncated"] = Value::Bool(traffic.truncated || response_truncated);
+        } else {
+            let previous_truncated = body["truncated"].as_bool().unwrap_or(false);
+            body["truncated"] = Value::Bool(previous_truncated || traffic.truncated);
+        }
+    }
+    match preview {
         Some(value) => ok_json(value),
         None => errors::management_error(404, format!("未找到该请求的原始报文（id: {id}）")),
     }

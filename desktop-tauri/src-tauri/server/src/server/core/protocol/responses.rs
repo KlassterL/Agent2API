@@ -2104,3 +2104,202 @@ impl Default for ResponsesCollector {
         Self::new()
     }
 }
+
+/// 非流式原生 Responses：保留完成事件中的完整 response 对象。
+pub struct RawResponsesCollector {
+    buffer: SseLineBuffer,
+    response: Option<Value>,
+    response_seed: Option<Value>,
+    completed_output_items: std::collections::BTreeMap<u64, Value>,
+    error: Option<String>,
+    bytes_seen: usize,
+    too_large: bool,
+}
+
+impl RawResponsesCollector {
+    const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+    pub fn new() -> Self {
+        Self {
+            buffer: SseLineBuffer::new(),
+            response: None,
+            response_seed: None,
+            completed_output_items: std::collections::BTreeMap::new(),
+            error: None,
+            bytes_seen: 0,
+            too_large: false,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) {
+        if self.too_large {
+            return;
+        }
+        self.bytes_seen = self.bytes_seen.saturating_add(chunk.len());
+        if self.bytes_seen > Self::MAX_RESPONSE_BYTES {
+            self.too_large = true;
+            return;
+        }
+        for payload in self.buffer.push(chunk) {
+            if let Some(data) = payload {
+                if let Ok(event) = serde_json::from_str::<Value>(&data) {
+                    self.consume(&event);
+                }
+            }
+        }
+    }
+
+    pub fn finish(&mut self) {
+        if self.too_large {
+            return;
+        }
+        for payload in self.buffer.finish() {
+            if let Some(data) = payload {
+                if let Ok(event) = serde_json::from_str::<Value>(&data) {
+                    self.consume(&event);
+                }
+            }
+        }
+    }
+
+    fn consume(&mut self, event: &Value) {
+        match string_field(event, "type").as_str() {
+            "response.created" | "response.in_progress" => {
+                if let Some(response) = event.get("response").filter(|response| response.is_object()) {
+                    self.response_seed = Some(response.clone());
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item").filter(|item| item.is_object()) {
+                    let index = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(self.completed_output_items.len() as u64);
+                    self.completed_output_items.insert(index, item.clone());
+                }
+            }
+            "response.completed" | "response.incomplete" | "response.failed" | "response.done" => {
+                if let Some(response) = event.get("response").filter(|response| response.is_object()) {
+                    self.response = Some(response.clone());
+                }
+            }
+            "error" => {
+                let message = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("上游 Responses 请求失败");
+                self.error = Some(message.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    pub fn into_response(self) -> Result<Value, String> {
+        if self.too_large {
+            return Err("上游 Responses 响应超过 128 MiB".to_string());
+        }
+        let image_result_completed = self.completed_output_items.values().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                && item
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .is_some_and(|result| !result.is_empty())
+        });
+        let completed_output = Value::Array(
+            self.completed_output_items
+                .values()
+                .cloned()
+                .collect(),
+        );
+
+        if let Some(mut response) = self.response {
+            let terminal_status = response.get("status").and_then(Value::as_str);
+            let terminal_has_image_result = response
+                .get("output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                            && item
+                                .get("result")
+                                .and_then(Value::as_str)
+                                .is_some_and(|result| !result.is_empty())
+                    })
+                });
+            if image_result_completed
+                && !terminal_has_image_result
+                && !matches!(terminal_status, Some("incomplete" | "failed"))
+            {
+                if let Some(object) = response.as_object_mut() {
+                    object.insert("status".to_string(), Value::String("completed".to_string()));
+                    object.insert("output".to_string(), completed_output.clone());
+                }
+            }
+            return Ok(response);
+        }
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if image_result_completed {
+            if let Some(mut response) = self.response_seed {
+                if let Some(object) = response.as_object_mut() {
+                    object.insert("status".to_string(), Value::String("completed".to_string()));
+                    object.insert("output".to_string(), completed_output);
+                }
+                return Ok(response);
+            }
+        }
+        Err("上游 Responses 流在完成前结束".to_string())
+    }
+}
+
+impl Default for RawResponsesCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod raw_responses_collector_tests {
+    use super::RawResponsesCollector;
+    use serde_json::json;
+
+    #[test]
+    fn completed_image_item_is_kept_when_upstream_omits_response_completed() {
+        let mut collector = RawResponsesCollector::new();
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "status": "in_progress",
+                "model": "gpt-6.1-sol",
+                "output": []
+            }
+        });
+        collector.push(format!("data: {created}\n\n").as_bytes());
+
+        let item = json!({
+            "id": "ig_test",
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": "cG5n"
+        });
+        let item_done = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item
+        });
+        collector.push(format!("data: {item_done}\n\n").as_bytes());
+        collector.finish();
+
+        let response = collector
+            .into_response()
+            .expect("completed image output item is a successful response");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["type"], "image_generation_call");
+        assert_eq!(response["output"][0]["result"], "cG5n");
+    }
+}

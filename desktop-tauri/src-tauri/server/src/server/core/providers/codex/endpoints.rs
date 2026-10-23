@@ -1,9 +1,12 @@
-//! Codex OAuth 与 Responses API 端点。
+//! Codex OAuth、Responses 与 Images API 端点。
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const IMAGES_GENERATIONS_URL: &str = "https://chatgpt.com/backend-api/codex/images/generations";
+pub const IMAGES_EDITS_URL: &str = "https://chatgpt.com/backend-api/codex/images/edits";
 pub const CALLBACK_PATH: &str = "/auth/callback";
 pub const CALLBACK_PORT: u16 = 1455;
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";

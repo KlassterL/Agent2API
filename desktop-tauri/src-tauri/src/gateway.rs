@@ -30,6 +30,8 @@ pub const DEFAULT_PORT: u16 = 3065;
 /// release 构建（唯一的发布形态）行为不变，仍用 [`DEFAULT_PORT`]。
 pub const DEV_PORT: u16 = 3066;
 pub const REQUEST_TIMEOUT_MS: u64 = 60_000;
+/// 图片生成测试可能要等上游完成整张图片；只放宽这一个管理端点。
+pub const MODEL_TEST_REQUEST_TIMEOUT_MS: u64 = 150_000;
 
 /// 本次运行实际使用的端口。
 ///
@@ -213,16 +215,23 @@ pub fn management_key() -> Option<String> {
     read_api_key()
 }
 
-fn client() -> Result<reqwest::Client, String> {
+fn client(timeout_ms: u64) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
+        .timeout(Duration::from_millis(timeout_ms))
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
 }
 
 fn request_builder(method: &str, path: &str, body: Option<&Value>) -> Result<reqwest::RequestBuilder, String> {
     let url = format!("http://127.0.0.1:{}{path}", proxy_port());
-    let base = client()?;
+    let timeout_ms = if method.eq_ignore_ascii_case("POST")
+        && path.split('?').next() == Some("/api/models/test")
+    {
+        MODEL_TEST_REQUEST_TIMEOUT_MS
+    } else {
+        REQUEST_TIMEOUT_MS
+    };
+    let base = client(timeout_ms)?;
     let mut builder = match method.to_uppercase().as_str() {
         "GET" => base.get(&url),
         "POST" => base.post(&url),

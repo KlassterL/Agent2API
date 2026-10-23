@@ -63,37 +63,59 @@ impl ProviderAdapter for CodexAdapter {
             return Err(GatewayError::with_status(400, "Codex 请求缺少 model 字段"));
         }
         let image_request = body.get("__codex_image_request");
-        let mut request = if let Some(image_request) = image_request {
+        let is_image_request = image_request.is_some();
+        let image_stream = image_request
+            .and_then(|request| request.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (url, mut request) = if let Some(image_request) = image_request {
             if !models::is_image_model(model) {
                 return Err(GatewayError::bad_request(
                     "Codex 图片请求必须使用 GPT Image 模型",
                 ));
             }
-            super::images::responses_request(image_request).map_err(|message| {
+            let (url, request) = super::images::direct_request(image_request).map_err(|message| {
                 GatewayError::with_status(400, format!("Codex 图片请求转换失败：{message}"))
-            })?
+            })?;
+            (url, request)
         } else {
             if models::is_image_model(model) {
                 return Err(GatewayError::bad_request(
                     "GPT Image 模型请通过 /v1/images/generations 或 /v1/images/edits 使用",
                 ));
             }
-            protocol::responses_outbound::responses_request_from_chat(body, model).map_err(
-                |message| GatewayError::with_status(400, format!("Codex 请求转换失败：{message}")),
-            )?
+            let request = protocol::responses_outbound::responses_request_from_chat(body, model)
+                .map_err(|message| {
+                    GatewayError::with_status(400, format!("Codex 请求转换失败：{message}"))
+                })?;
+            (endpoints::RESPONSES_URL.to_string(), request)
         };
-        if let Some(object) = request.as_object_mut() {
-            object.insert("stream".to_string(), Value::Bool(true));
-            object.insert("store".to_string(), Value::Bool(false));
+        if !is_image_request {
+            if let Some(object) = request.as_object_mut() {
+                object.insert("stream".to_string(), Value::Bool(true));
+                object.insert("store".to_string(), Value::Bool(false));
+            }
         }
-        let headers = vec![
+        let mut headers = vec![
             (
                 "Authorization".to_string(),
                 format!("Bearer {access_token}"),
             ),
             ("ChatGPT-Account-Id".to_string(), account_id.to_string()),
             ("Content-Type".to_string(), "application/json".to_string()),
-            ("Accept".to_string(), "text/event-stream".to_string()),
+            (
+                "Accept".to_string(),
+                if is_image_request {
+                    if image_stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }
+                } else {
+                    "text/event-stream"
+                }
+                .to_string(),
+            ),
             ("Originator".to_string(), endpoints::ORIGINATOR.to_string()),
             (
                 "Session-Id".to_string(),
@@ -101,15 +123,15 @@ impl ProviderAdapter for CodexAdapter {
             ),
             ("User-Agent".to_string(), endpoints::USER_AGENT.to_string()),
         ];
-        if image_request.is_some() {
-            Ok(ChatRequestPlan::codex_images_responses(
-                endpoints::RESPONSES_URL.to_string(),
-                headers,
-                request,
-            ))
+        if is_image_request {
+            headers.push((
+                "x-codex-image-turn-id".to_string(),
+                crate::server::core::upstream::request::new_request_id(),
+            ));
+            Ok(ChatRequestPlan::codex_images(url, headers, request))
         } else {
             Ok(ChatRequestPlan::codex_responses(
-                endpoints::RESPONSES_URL.to_string(),
+                url,
                 headers,
                 request,
             ))

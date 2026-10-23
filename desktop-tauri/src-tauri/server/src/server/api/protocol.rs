@@ -156,6 +156,28 @@ pub async fn responses_endpoint(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if raw
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("image_generation"))
+        })
+    {
+        let error = GatewayError::bad_request(
+            "GPT Image 请求请使用 /v1/images/generations 或 /v1/images/edits",
+        );
+        record_early_failure(
+            &state,
+            started_at,
+            &pipeline::model_field_text(&raw),
+            "",
+            &client,
+            &error,
+        );
+        return error.payload_response();
+    }
     // 原始请求体留一份：回程要用它回显请求侧字段（instructions / tools / …），
     // 而下面会把 payload 改写成 Chat 形态
     let original = raw.clone();

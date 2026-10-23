@@ -1660,7 +1660,8 @@ async fn attempt_queue(
 
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
-        // 三条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
+        // 下列协议由各自的翻译器转成 chat SSE。Codex Images 已是公开的 Images
+        // JSON/SSE 格式，在下方作为独立原始透传路径处理：
         //   - ZCode 的活动套餐通道说 Anthropic SSE；
         //   - Command Code 说 NDJSON（`application/x-ndjson`，**HTTP 恒 200**、
         //     错误在流内），那家返回的 200 不代表这一轮生成成功 —— 成败由
@@ -1668,7 +1669,7 @@ async fn attempt_queue(
         //   - Antigravity 说 Gemini v1internal SSE（`data: {"response":{…}}`
         //     信封，字段路径是 Gemini 方言）——上游状态码仍是成败判据，
         //     翻译机只折字节形态（流内错误另走错误帧）。
-        // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
+        // 翻译在**两处出口之前**做，于是这些协议的流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
         // 说 chat 的家（含自定义家）跳过这一整段，直接走下面的原生路径。
         //
@@ -1685,6 +1686,30 @@ async fn attempt_queue(
             };
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
             let status = response.status().as_u16();
+            if response_protocol == UpstreamResponse::CodexImages {
+                let image_stream_requested = ctx
+                    .body
+                    .pointer("/__codex_image_request/stream")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let image_stream = image_stream_requested && (200..300).contains(&status);
+                if ctx.stream {
+                    return Ok(ForwardOutcome::Stream {
+                        status,
+                        stream: Box::new(super::ForwardStream::new_codex_images(
+                            response,
+                            slot.take(),
+                            connections.handoff(),
+                            ctx.telemetry.clone(),
+                            image_stream,
+                        )),
+                    });
+                }
+                return Err(GatewayError::with_status(
+                    500,
+                    "内部错误：Codex 图片响应必须以流式方式读取",
+                ));
+            }
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
@@ -1718,9 +1743,12 @@ async fn attempt_queue(
                         ctx.telemetry,
                     ))
                 }
-                UpstreamResponse::CodexImageResponses => Box::pin(
-                    super::translate::CodexImageResponsesStream::new(response, ctx.telemetry),
-                ),
+                UpstreamResponse::CodexImages => {
+                    return Err(GatewayError::with_status(
+                        500,
+                        "内部错误：Codex 图片响应必须使用原始透传路径",
+                    ))
+                }
                 // 外层 `if` 已排除它，这一支只为 match 的穷尽性存在，**不可能
                 // 走到**。真走到说明分派被改坏了：报内部错误而不是 panic
                 // （release 是 `panic=abort`，一处 panic 带走整个网关）。
@@ -1731,11 +1759,7 @@ async fn attempt_queue(
                     ))
                 }
             };
-            let frame_policy = if response_protocol == UpstreamResponse::CodexImageResponses {
-                super::sse::FramePolicy::default()
-            } else {
-                frame_policy_of(adapter, &model)
-            };
+            let frame_policy = frame_policy_of(adapter, &model);
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,
@@ -1747,12 +1771,6 @@ async fn attempt_queue(
                         frame_policy,
                     )),
                 });
-            }
-            if response_protocol == UpstreamResponse::CodexImageResponses {
-                return Err(GatewayError::with_status(
-                    500,
-                    "内部错误：Codex 图片响应必须以流式方式读取",
-                ));
             }
             let aggregated = super::aggregate::aggregate_frame_stream(
                 translated,

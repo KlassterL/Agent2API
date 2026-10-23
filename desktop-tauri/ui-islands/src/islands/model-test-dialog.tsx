@@ -89,6 +89,7 @@ type TestModelResponse = {
   error?: string | null
   reply?: string
   reasoning?: string
+  image_data_urls?: string[]
   provider?: string
   model?: string
   protocol?: string
@@ -351,6 +352,8 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   const [systemPrompt, setSystemPrompt] = React.useState('')
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT)
   const [protocol, setProtocol] = React.useState('chat_completions')
+  const codexImageModel = provider.toLowerCase() === 'codex' && /^gpt-image-/i.test(target.id)
+  const effectiveProtocol = codexImageModel ? 'responses' : protocol
   const [proxy, setProxy] = React.useState('')
   const [pool, setPool] = React.useState<PoolItem[] | null>(null)
   const [poolError, setPoolError] = React.useState('')
@@ -423,7 +426,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
       system_prompt: systemPrompt.trim(),
       reasoning,
       stream,
-      protocol,
+      protocol: effectiveProtocol,
       ...(proxy ? { proxy } : {}),
       test_id: slot.testId,
     }
@@ -529,7 +532,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   ].filter(Boolean).join(t('；')) + t('。')
 
   const protocols = bridge().wbProviders?.PROTOCOL_OPTIONS || FALLBACK_PROTOCOLS
-  const protocolLabel = protocols.find(item => item.value === protocol)?.label || protocol
+  const protocolLabel = protocols.find(item => item.value === effectiveProtocol)?.label || effectiveProtocol
   const proxyItems: Array<{ value: string; label: string; disabled?: boolean }> = [
     { value: '', label: t('跟随账号配置') },
     { value: PROXY_DIRECT, label: t('直连（不使用代理）') },
@@ -608,6 +611,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
     }
 
     const reply = String(result?.reply ?? '')
+    const imageDataUrls = result?.image_data_urls ?? []
     const reasoningText = String(result?.reasoning ?? '')
     const foldKey = `think-${slot.testId}`
     // 「上游 xxx」只在实际模型与被测名不同（映射改名）时才有信息量，同名不重复念一遍；
@@ -634,6 +638,14 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
             {/* 复制走 clipboard.js 的全局委托（data-copy），与模型名那枚复制同一套 */}
             <Button variant='ghost' size='2xs' className='ml-auto flex-none' data-copy={reply}>{t('复制')}</Button>
           </div>
+          {imageDataUrls.length ? (
+            <div className='grid max-h-[360px] gap-2 overflow-y-auto rounded-sm border border-border bg-surface p-2'>
+              {imageDataUrls.map((image, index) => (
+                <img key={`${slot.testId}-image-${index}`} src={image} alt='Generated image'
+                  className='mx-auto max-h-[340px] max-w-full rounded-sm object-contain' />
+              ))}
+            </div>
+          ) : null}
           <div className='max-h-[220px] overflow-y-auto whitespace-pre-wrap rounded-sm border border-border bg-surface px-3 py-2 text-[12.5px] leading-[1.7]'>
             {reply || <span className='text-subtle'>{t('（上游这一次返回了空正文）')}</span>}
           </div>
@@ -739,7 +751,8 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
                   <TooltipContent>{t('按所选网关对话协议组装请求并校验响应转换（Chat Completions / Responses / Anthropic Messages）。')}</TooltipContent>
                 </Tooltip>
               </div>
-              <Select value={protocol} onValueChange={next => setProtocol(String(next))}>
+              <Select value={effectiveProtocol} disabled={codexImageModel}
+                onValueChange={next => setProtocol(String(next))}>
                 <SelectTrigger id='model-test-protocol' className='w-full'>
                   <SelectValue className='min-w-0 truncate'>{protocolLabel}</SelectValue>
                 </SelectTrigger>

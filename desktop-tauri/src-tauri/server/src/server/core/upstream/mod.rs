@@ -530,6 +530,10 @@ pub struct ForwardStream {
     coalescer: ReasoningCoalescer,
     /// 上游已结束（不再 poll 上游，只把 pending 吐完）
     upstream_done: bool,
+    /// Codex Images 的公开响应已经是 Images JSON/SSE，必须按原字节透传。
+    raw_passthrough: bool,
+    /// 下游请求的是 Images SSE；上游中断时用 Images `event: error` 格式收尾。
+    image_stream: bool,
     /// 缓存的待下发帧（一个上游 chunk 可能产出多帧）
     pending: std::collections::VecDeque<Bytes>,
     /// 在途槽位凭证：本流被 drop 时释放（含客户端断开、上游断开两条路径）。
@@ -583,6 +587,40 @@ impl ForwardStream {
         stream
     }
 
+    /// Codex Images 的上游响应已经符合 Images API 格式，直接透传 JSON 或 SSE。
+    pub(super) fn new_codex_images(
+        response: reqwest::Response,
+        slot: Option<InFlightGuard>,
+        connection: ConnectionGuard,
+        telemetry: Arc<usage::RequestTelemetry>,
+        image_stream: bool,
+    ) -> Self {
+        use futures::StreamExt;
+        let inner = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        let guarded = stall::idle_guard(
+            Box::pin(inner),
+            Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
+        );
+        let inner = cancellation::cancellable(Box::pin(guarded), telemetry.cancel_token());
+        let capture = telemetry.capture();
+        Self {
+            inner,
+            coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone()),
+            upstream_done: false,
+            raw_passthrough: true,
+            image_stream,
+            pending: std::collections::VecDeque::new(),
+            _slot: slot,
+            _connection: connection,
+            telemetry,
+            capture,
+        }
+    }
+
     /// 翻译协议的构造入口：`inner` 已经是**标准 chat SSE** 帧流。
     ///
     /// 自定义家的 responses / anthropic 上游先过 `providers::custom` 的
@@ -615,6 +653,8 @@ impl ForwardStream {
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
                 .with_policy(policy),
             upstream_done: false,
+            raw_passthrough: false,
+            image_stream: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,
             _connection: connection,
@@ -639,6 +679,45 @@ impl Stream for ForwardStream {
             }
             if self.upstream_done {
                 return std::task::Poll::Ready(None);
+            }
+            if self.raw_passthrough {
+                match self.inner.poll_next_unpin(context) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(None) => {
+                        self.upstream_done = true;
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::task::Poll::Ready(Some(Ok(bytes))) => {
+                        if let Some(capture) = &self.capture {
+                            capture.push(&bytes);
+                        }
+                        return std::task::Poll::Ready(Some(Ok(bytes)));
+                    }
+                    std::task::Poll::Ready(Some(Err(error))) => {
+                        self.upstream_done = true;
+                        let text = error.to_string();
+                        let message = if text == cancellation::MANUAL_TERMINATED
+                            || text.starts_with(stall::IDLE_TIMEOUT_PREFIX)
+                        {
+                            text
+                        } else {
+                            format!("Codex 图片上游流中断：{error}")
+                        };
+                        logging::console_line("[Model]", &format!("❌ {message}"));
+                        self.telemetry.note_error(&message);
+                        if self.image_stream {
+                            let payload = serde_json::to_string(&json!({
+                                "error": { "message": message, "type": "proxy_error" }
+                            }))
+                            .unwrap_or_else(|_| {
+                                "{\"error\":{\"message\":\"Codex 图片上游流中断\",\"type\":\"proxy_error\"}}".to_string()
+                            });
+                            let frame = Bytes::from(format!("event: error\ndata: {payload}\n\n"));
+                            return std::task::Poll::Ready(Some(Ok(frame)));
+                        }
+                        return std::task::Poll::Ready(Some(Err(std::io::Error::other(message))));
+                    }
+                }
             }
             match self.inner.poll_next_unpin(context) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,

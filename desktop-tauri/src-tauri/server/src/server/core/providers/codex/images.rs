@@ -1,10 +1,8 @@
-//! OpenAI Images API 请求到 Codex Responses `image_generation` 工具的映射。
+//! OpenAI Images API 请求到 Codex Images API 的映射。
 
 use serde_json::{json, Value};
 
-pub const MAIN_MODEL: &str = "gpt-5.4-mini";
-
-pub fn responses_request(image: &Value) -> Result<Value, String> {
+pub fn direct_request(image: &Value) -> Result<(String, Value), String> {
     let action = image
         .get("action")
         .and_then(Value::as_str)
@@ -24,11 +22,7 @@ pub fn responses_request(image: &Value) -> Result<Value, String> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "图片请求缺少 prompt".to_string())?;
 
-    let mut tool = json!({
-        "type": "image_generation",
-        "model": image_model,
-        "action": action,
-    });
+    let mut request = json!({ "model": image_model, "prompt": prompt });
     for field in [
         "size",
         "quality",
@@ -36,24 +30,38 @@ pub fn responses_request(image: &Value) -> Result<Value, String> {
         "output_format",
         "input_fidelity",
         "moderation",
+        "response_format",
     ] {
-        if let Some(value) = image.get(field).filter(|value| value.is_string()) {
-            if !value.as_str().unwrap_or_default().trim().is_empty() {
-                tool[field] = value.clone();
-            }
+        if let Some(value) = image.get(field).filter(|value| !value.is_null()) {
+            request[field] = value.clone();
         }
     }
-    let stream_requested = image
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    for field in ["output_compression", "partial_images"] {
-        if field == "partial_images" && !stream_requested {
-            continue;
+    for field in ["n", "output_compression", "partial_images"] {
+        if let Some(value) = image
+            .get(field)
+            .filter(|value| value.as_i64().is_some() || value.as_u64().is_some())
+        {
+            request[field] = value.clone();
         }
-        if let Some(value) = image.get(field).and_then(Value::as_i64) {
-            tool[field] = Value::from(value);
+    }
+    if let Some(stream) = image.get("stream").and_then(Value::as_bool) {
+        request["stream"] = Value::Bool(stream);
+    }
+    if action == "edit" {
+        let images = image
+            .get("images")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| json!({ "image_url": url }))
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            return Err("图片编辑请求至少需要一个输入图像".to_string());
         }
+        request["images"] = Value::Array(images);
     }
     if let Some(mask) = image
         .get("mask")
@@ -61,30 +69,12 @@ pub fn responses_request(image: &Value) -> Result<Value, String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        tool["input_image_mask"] = json!({ "image_url": mask });
+        request["mask"] = json!({ "image_url": mask });
     }
-
-    let mut content = vec![json!({ "type": "input_text", "text": prompt })];
-    if let Some(images) = image.get("images").and_then(Value::as_array) {
-        for image_url in images
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            content.push(json!({ "type": "input_image", "image_url": image_url }));
-        }
-    }
-
-    Ok(json!({
-        "model": MAIN_MODEL,
-        "input": [{ "type": "message", "role": "user", "content": content }],
-        "stream": true,
-        "store": false,
-        "reasoning": { "effort": "medium", "summary": "auto" },
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"],
-        "tool_choice": { "type": "image_generation" },
-        "tools": [tool],
-    }))
+    let url = match action {
+        "generate" => super::endpoints::IMAGES_GENERATIONS_URL,
+        "edit" => super::endpoints::IMAGES_EDITS_URL,
+        _ => return Err("图片请求缺少有效的 action".to_string()),
+    };
+    Ok((url.to_string(), request))
 }

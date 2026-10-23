@@ -1,4 +1,4 @@
-//! 上游**响应协议**的翻译层：上游吐的不是 chat SSE 时，先折成 chat SSE 再下发。
+//! 上游**响应协议**的翻译层：需要转成 chat SSE 的上游响应在这里转换。
 //!
 //! ── 为什么在内置家的路径上需要它 ────────────────────────────
 //! `ForwardStream` 与聚合器只认**标准 chat SSE**（它们是 SSE 逐行解析的唯一
@@ -9,8 +9,10 @@
 //! `providers::zcode::plan`）由编排层移交凭证，因此这里给一个**不持凭证**的
 //! 版本：构造它、交给 `ForwardStream::from_translated` 或聚合器，凭证仍由
 //! `provider_loop` 那两处按既有规则处置。
+//! Codex Images 上游已经返回公开 Images JSON/SSE，因此绕过本模块，在转发流中
+//! 原样透传。
 //!
-//! ── 本文件服务三种上游响应协议（三家各一台，互不共用）──────────
+//! ── 本文件服务四类上游响应协议 ─────────────────────────────
 //!   1. **Anthropic Messages SSE**（`AnthropicToChatStream` ←
 //!      `protocol::anthropic_outbound::ChatFromAnthropicStream`）：内置家里只有
 //!      ZCode 的活动套餐通道说这套协议；
@@ -26,8 +28,10 @@
 //!      `{"response":{…gemini…}}` 信封（缺省回退顶层），字段路径（`candidates`
 //!      / `usageMetadata` / `thought` / `thoughtSignature`）全是 Gemini 方言 ——
 //!      与上面两台同样没有可复用的词表，另开一台。
-//! 三台壳逐行同构（同一种错误处置、同一种空闲守卫、同一种调试采集），
-//! 差别只有内部那台状态机与日志前缀 —— 因此下面三个 struct 读起来是镜像的。
+//!   4. **Codex Responses SSE**（`ResponsesToChatStream`）：复用
+//!      `protocol::responses_outbound::ChatFromResponsesStream` 状态机。
+//! 前三台壳逐行同构（同一种错误处置、同一种空闲守卫、同一种调试采集），
+//! 差别只有内部那台状态机与日志前缀 —— 因此三个 provider 专用 struct 读起来是镜像的。
 //!
 //! ── 与自定义家那条的三个差别（都是刻意的）────────────────────
 //!   1. `model` 传**上游真名**（与自定义家一致）：帧里的 `model` 由下游的
@@ -53,51 +57,6 @@ use crate::server::core::protocol::anthropic_outbound::ChatFromAnthropicStream;
 use crate::server::core::protocol::antigravity_stream::ChatFromAntigravityStream;
 use crate::server::core::protocol::commandcode_outbound::ChatFromCommandCodeStream;
 use crate::server::core::protocol::responses_outbound::ChatFromResponsesStream;
-
-/// Codex 图片 Responses SSE：原样保留 `image_generation_call` 与分片图片事件。
-pub struct CodexImageResponsesStream {
-    inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
-    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
-}
-
-impl CodexImageResponsesStream {
-    pub fn new(
-        response: reqwest::Response,
-        telemetry: &Arc<super::usage::RequestTelemetry>,
-    ) -> Self {
-        use futures::StreamExt;
-        let described = response.bytes_stream().map(|item| {
-            item.map_err(|error| {
-                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
-            })
-        });
-        let inner = super::stall::idle_guard(
-            Box::pin(described),
-            Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
-        );
-        Self {
-            inner,
-            capture: telemetry.capture(),
-        }
-    }
-}
-
-impl Stream for CodexImageResponsesStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll_next(context) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                if let Some(capture) = &this.capture {
-                    capture.push(&bytes);
-                }
-                Poll::Ready(Some(Ok(bytes)))
-            }
-            other => other,
-        }
-    }
-}
 
 /// 上游 Anthropic SSE → 标准 chat SSE 的字节流（`reqwest::Response` 直接进来）。
 ///

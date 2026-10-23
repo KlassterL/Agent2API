@@ -192,6 +192,7 @@
   function assistantInner(parts, reasoning) {
     return reasoningsHtml(reasoning)
       + richText(parts.text)
+      + (parts.images || []).map(url => imgHtml(url, wbI18n.t('图片结果'))).join('')
       + parts.calls.map(callHtml).join('')
       + parts.results.map(result => toolDetailsHtml(esc(result.label), { text: result.text, images: [], calls: [] })).join('');
   }
@@ -261,6 +262,24 @@
       const filled = blocks.filter(Boolean);
       if (filled.length) return filled.join('');
     }
+    const imageBody = isPlainObject(body) && isPlainObject(body.__codex_image_request)
+      ? body.__codex_image_request
+      : body;
+    if (isPlainObject(imageBody) && typeof imageBody.prompt === 'string') {
+      const content = [{ type: 'text', text: imageBody.prompt }];
+      const imageValues = [
+        ...(Array.isArray(imageBody.images) ? imageBody.images : []),
+        ...(imageBody.image ? [imageBody.image] : []),
+        ...(imageBody.mask ? [imageBody.mask] : []),
+      ];
+      for (const image of imageValues) {
+        const url = typeof image === 'string'
+          ? image
+          : image?.image_url?.url ?? image?.image_url ?? image?.url;
+        if (typeof url === 'string' && url) content.push({ type: 'input_image', image_url: url });
+      }
+      return messageHtml({ role: 'user', content });
+    }
     // 降级：不是 JSON / 没有 messages / 消息全空 —— 说清为什么，并保留原文
     return wbI18n.t('<div class="cv-parse-empty">无法解析请求体（不是含 messages 数组的 JSON）</div>')
       + `<details class="cv-details">${wbI18n.t('<summary>请求原文</summary>')}<pre class="req-detail-pre">${esc(source)}</pre></details>`;
@@ -269,19 +288,29 @@
   // ─── 响应侧：SSE / JSON → 助手气泡 ────────────
 
   /** 以 data: 行开头即按 SSE 解析（任务口径；event: 行的帧也由 data 承载内容） */
-  const looksSse = raw => /^\s*data:/.test(raw);
+  const looksSse = raw => /^\s*(?:event|data):/.test(raw);
 
   /** SSE 分帧：帧间空行分隔，data 行可多行（按 SSE 规范用 \n 连接） */
   function sseFrames(raw) {
     const frames = [];
     for (const block of raw.split(/\r?\n\r?\n+/)) {
+      let event = '';
       const data = [];
       for (const line of block.split(/\r?\n/)) {
-        if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
       }
-      if (data.length) frames.push(data.join('\n'));
+      if (data.length) frames.push({ event, data: data.join('\n') });
     }
     return frames;
+  }
+
+  /** Images API 以 b64_json 返回图片；输出格式按响应、请求参数顺序回退。 */
+  function imageDataUrl(b64, format) {
+    const normalized = String(format || 'png').toLowerCase();
+    const subtype = normalized === 'jpeg' || normalized === 'jpg' ? 'jpeg'
+      : normalized === 'webp' ? 'webp' : 'png';
+    return `data:image/${subtype};base64,${b64}`;
   }
 
   /**
@@ -291,20 +320,33 @@
    * 累积（name 拼一次、arguments 字符串逐段接上）。
    * 返回 null = 一帧有效内容都没有（调用方降级为原文折叠）。
    */
-  function parseSseResponse(raw) {
+  function parseSseResponse(raw, requestedFormat = 'png') {
     let content = '';
     let reasoning = '';
     const calls = new Map();
+    const partialImages = new Map();
+    const completedImages = [];
     let errorText = '';
     for (const frame of sseFrames(raw)) {
-      if (frame === '[DONE]') continue;
+      if (frame.data === '[DONE]') continue;
       let parsed = null;
       try {
-        parsed = JSON.parse(frame);
+        parsed = JSON.parse(frame.data);
       } catch {
         continue;   // 非 JSON 帧（keep-alive 等）跳过
       }
       if (!isPlainObject(parsed)) continue;
+      const type = String(parsed.type || frame.event || '');
+      if (type === 'image_generation.partial_image' || type === 'image_edit.partial_image') {
+        if (typeof parsed.b64_json === 'string' && parsed.b64_json) {
+          const index = Number.isFinite(parsed.partial_image_index) ? parsed.partial_image_index : partialImages.size;
+          partialImages.set(index, imageDataUrl(parsed.b64_json, parsed.output_format || requestedFormat));
+        }
+      } else if (type === 'image_generation.completed' || type === 'image_edit.completed') {
+        if (typeof parsed.b64_json === 'string' && parsed.b64_json) {
+          completedImages.push(imageDataUrl(parsed.b64_json, parsed.output_format || requestedFormat));
+        }
+      }
       const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
       const delta = isPlainObject(choice) ? choice.delta : null;
       if (isPlainObject(delta)) {
@@ -331,8 +373,9 @@
       }
     }
     const finalCalls = [...calls.values()].map(call => ({ name: call.name || 'tool', args: prettyJson(call.args) }));
-    if (!content && !reasoning && !finalCalls.length && !errorText) return null;
-    return { text: content, reasoning, calls: finalCalls, errorText };
+    const images = completedImages.length ? completedImages : [...partialImages.values()];
+    if (!content && !reasoning && !finalCalls.length && !images.length && !errorText) return null;
+    return { text: content, reasoning, calls: finalCalls, images, errorText };
   }
 
   /** 非流式 JSON 响应 → 助手消息；error 字段按「系统条」展示原因 */
@@ -347,6 +390,23 @@
     if (body.error) {
       const message = isPlainObject(body.error) ? body.error.message : body.error;
       return { errorText: String(message ?? wbI18n.t('上游返回错误')) };
+    }
+    if (Array.isArray(body.data) || (typeof body.b64_json === 'string' && body.b64_json)) {
+      const entries = Array.isArray(body.data) ? body.data : [body];
+      const images = [];
+      let revisedPrompt = '';
+      for (const item of entries) {
+        if (!isPlainObject(item)) continue;
+        if (typeof item.b64_json === 'string' && item.b64_json) {
+          images.push(imageDataUrl(item.b64_json, item.output_format || body.output_format || 'png'));
+        } else if (typeof item.url === 'string' && item.url) {
+          images.push(item.url);
+        }
+        if (!revisedPrompt && typeof item.revised_prompt === 'string') revisedPrompt = item.revised_prompt;
+      }
+      if (images.length || revisedPrompt) {
+        return { text: revisedPrompt, images, reasoning: '', calls: [], errorText: '' };
+      }
     }
     if (Array.isArray(body.output)) {
       // OpenAI Responses 响应体：output 数组含 reasoning / message / function_call 项
